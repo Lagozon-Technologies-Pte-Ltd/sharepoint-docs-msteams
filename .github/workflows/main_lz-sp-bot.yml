@@ -51,11 +51,15 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: python-app
-      
+      - name: Log in to Azure CLI using service principal
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
       - name: 'Deploy to Azure Web App'
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
           app-name: 'lz-sp-bot'
           slot-name: 'Production'
+
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_CB814B858CE7411A9834DE0F5ACA2D51 }}

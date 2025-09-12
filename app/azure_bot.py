@@ -29,7 +29,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app_rag_chroma_bot")
 
 # ---------- OpenAI client ----------
-openai_client = OpenAI()
+api_key = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=api_key)
 
 # ---------- FastAPI ----------
 app = FastAPI()

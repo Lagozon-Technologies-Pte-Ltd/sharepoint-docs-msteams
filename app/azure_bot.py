@@ -6,6 +6,8 @@ import requests
 from dotenv import load_dotenv
 from msal import ConfidentialClientApplication
 import PyPDF2
+from urllib.parse import urljoin
+
 import pandas as pd
 import docx
 from fastapi import FastAPI, Query, Request
@@ -29,8 +31,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app_rag_chroma_bot")
 
 # ---------- OpenAI client ----------
-api_key = os.getenv("OPENAI_API_KEY")
-openai_client = OpenAI(api_key=api_key)
+openai_api_key = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=openai_api_key)
 
 # ---------- FastAPI ----------
 app = FastAPI()
@@ -65,7 +67,7 @@ CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "2000"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 BATCH_SIZE = int(os.getenv("EMBED_BATCH", "16"))
 
-# ---------- Chroma init ----------
+# ---------- Chroma init ---------- 
 try:
     chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
 except Exception:
@@ -74,7 +76,7 @@ collection = chroma_client.get_or_create_collection(name=CHROMA_COLLECTION)
 
 # ---------- ThreadPool ----------
 executor = ThreadPoolExecutor(max_workers=4)
-
+ 
 # ----------------- Graph helpers -----------------
 def get_graph_token():
     """Token to call Microsoft Graph (SharePoint)."""
@@ -148,9 +150,52 @@ def list_docs_from_graph(library_name=LIBRARY_NAME):
     if not drive:
         raise SystemExit(f"Could not find drive/library named {library_name}")
     drive_id = drive["id"]
-    items = list_children(token, drive_id)
-    return [{"name": item.get("name"), "id": item.get("id")} for item in items if item.get("file")]
 
+    items = list_children(token, drive_id)
+    return [
+        {
+            "name": item.get("name"),
+            "id": item.get("id"),
+            "downloadUrl": item.get("@microsoft.graph.downloadUrl")
+        }
+        for item in items if item.get("file")
+    ]
+def build_doc_preview_card(answer: str, retrieved_docs: List[Dict[str, Any]]):
+    attachments = []
+    # Get unique docs
+    unique_doc_names = {doc["doc_name"] for doc in retrieved_docs if doc.get("doc_name")}
+    all_docs = list_docs_from_graph()
+    name_to_doc = {d["name"]: d for d in all_docs}
+
+    for doc_name in unique_doc_names:
+        doc = name_to_doc.get(doc_name)
+        if not doc:
+            continue
+
+        # HeroCard with file preview
+        attachments.append({
+            "contentType": "application/vnd.microsoft.card.hero",
+            "content": {
+                "title": doc_name,
+                "text": answer,
+                "buttons": [
+                    {
+                        "type": "invoke",
+                        "title": f"Open {doc_name}",
+                        "value": {
+                            "type": "openFilePreview",
+                            "filePreviewInfo": {
+                                "name": doc_name,
+                                "fileType": doc_name.split(".")[-1],
+                                "objectUrl": doc.get("downloadUrl")
+                            }
+                        }
+                    }
+                ]
+            }
+        })
+
+    return {"attachments": attachments}
 def fetch_docs_from_graph(library_name=LIBRARY_NAME):
     token = get_graph_token()
     site = find_site(token, HOSTNAME, SITE_PATH)
@@ -372,100 +417,102 @@ def answer_with_context(question: str, context: str, model: str = "gpt-4", max_t
     return answer, resp
 
 # ---------- Bot integration (direct MSAL + REST) ----------
-def get_rag_answer_sync(question: str) -> str:
+def get_rag_answer_sync(question: str):
     retrieved = query_chroma_topk(question, top_k=4)
     if not retrieved:
-        return "I couldn't find relevant information in the documents."
+        return "I couldn't find relevant information in the documents.", []
     context = build_context_from_chunks(retrieved, max_chars=12000)
     answer, _ = answer_with_context(question, context, model="gpt-4", max_tokens=400)
-    return answer
-
+    return answer, retrieved
 @app.post("/api/messages")
 async def messages(req: Request):
     try:
         data = await req.json()
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to parse incoming request as JSON")
         return JSONResponse(status_code=200, content={})  # ack but ignore
 
     logger.info("Received activity: %s", json.dumps(data)[:2000])
 
-    # basic validation
+    # ignore non-messages
     if data.get("type") != "message" or not data.get("text"):
-        return JSONResponse(status_code=200, content={})  # ignore non-message activities
+        return JSONResponse(status_code=200, content={})
 
-    user_text_raw = data.get("text", "")
-    user_text = user_text_raw.strip()
+    user_text = data.get("text", "").strip().lower()
+    reply = None
 
-    # commands (case-insensitive)
-    lowered = user_text.lower()
-    if lowered in ["refresh index", "rebuild index", "update docs"]:
-        # run synchronously (this can be long)
-        await asyncio.get_running_loop().run_in_executor(None, lambda: None)  # small yield
+    # -------------------- Handle commands --------------------
+    if user_text in ["refresh index", "rebuild index", "update docs"]:
         result = build_index_to_chroma(force_rebuild=True)
-        reply_text = f"✅ Index refreshed. {result['count']} chunks indexed."
-    elif lowered in ["list docs", "show documents", "list documents"]:
+        reply = {
+            "type": "message",
+            "text": f"✅ Index refreshed. {result['count']} chunks indexed.",
+            "from": data.get("recipient"),
+            "recipient": data.get("from"),
+            "conversation": data.get("conversation"),
+        }
+
+    elif user_text in ["list docs", "show documents", "list documents"]:
         try:
             docs = list_docs_from_graph()
-            names = [d["name"] for d in docs]
-            reply_text = f"✅ Documents found: {', '.join(names)}" if names else "No documents found."
+            if docs:
+                reply = {
+                    "type": "message",
+                    "text": "📂 Available documents:\n" + "\n".join([d["name"] for d in docs]),
+                    "from": data.get("recipient"),
+                    "recipient": data.get("from"),
+                    "conversation": data.get("conversation"),
+                }
+            else:
+                reply = {
+                    "type": "message",
+                    "text": "No documents found.",
+                    "from": data.get("recipient"),
+                    "recipient": data.get("from"),
+                    "conversation": data.get("conversation"),
+                }
         except Exception as e:
             logger.exception("Error listing docs")
-            reply_text = "Failed to list documents: " + str(e)
-    else:
-        # Send 'typing' activity first (best-effort)
-        service_url = data.get("serviceUrl")
-        conversation = data.get("conversation", {})
-        conversation_id = conversation.get("id")
-        try:
-            bot_token = get_bot_token()
-            typing_activity = {
-                "type": "typing",
+            reply = {
+                "type": "message",
+                "text": f"❌ Failed to list documents: {e}",
                 "from": data.get("recipient"),
                 "recipient": data.get("from"),
-                "conversation": conversation
+                "conversation": data.get("conversation"),
             }
-            requests.post(
-                f"{service_url}v3/conversations/{conversation_id}/activities",
-                headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
-                json=typing_activity,
-                timeout=10,
-            )
-        except Exception as e:
-            logger.warning("Failed sending typing activity: %s", e)
 
-        # Run RAG in threadpool
+    # -------------------- Else → RAG answer with preview card --------------------
+    else:
+# Run RAG in threadpool
         loop = asyncio.get_running_loop()
-        answer = await loop.run_in_executor(executor, get_rag_answer_sync, user_text)
-        reply_text = answer or "I couldn't find relevant information in the documents."
+        answer, retrieved = await loop.run_in_executor(executor, get_rag_answer_sync, user_text)
 
-    # Build the reply activity
-    reply = {
-        "type": "message",
-        "text": reply_text,
-        "from": data.get("recipient"),
-        "recipient": data.get("from"),
-        "conversation": data.get("conversation"),
-    }
+        # Attach preview links only for retrieved docs
+        reply_card = build_doc_preview_card(answer, retrieved)
 
-    # Send reply using Bot Framework token (separate from Graph)
+        reply = {
+            "type": "message",
+            "from": data.get("recipient"),
+            "recipient": data.get("from"),
+            "conversation": data.get("conversation"),
+            **reply_card
+        }
+
+    # -------------------- Send reply --------------------
     try:
-        bot_token = get_bot_token()
         service_url = data.get("serviceUrl")
         conversation_id = data.get("conversation", {}).get("id")
-        r = requests.post(
-            f"{service_url}v3/conversations/{conversation_id}/activities",
-            headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
-            json=reply,
-            timeout=30,
-        )
+        url = urljoin(service_url, f"v3/conversations/{conversation_id}/activities")
+
+        headers = {"Content-Type": "application/json"}
+        if not service_url.startswith("http://localhost"):
+            bot_token = get_bot_token()
+            headers["Authorization"] = f"Bearer {bot_token}"
+
+        r = requests.post(url, headers=headers, json=reply, timeout=30)
         logger.info("Posted reply: %s %s", r.status_code, r.text[:1000])
     except Exception as e:
-        logger.exception("Failed to post reply to serviceUrl: %s", e)
-
-    # Always ack with 200 OK so emulator/connector doesn't show "send failed"
-    return JSONResponse(status_code=200, content={})
-
+        logger.exception("Failed to post reply: %s", e)
 # ---------- admin/dev endpoints ----------
 @app.get("/build_index")
 def build_index_api(force: bool = Query(False, description="Force rebuild index in Chroma"),
